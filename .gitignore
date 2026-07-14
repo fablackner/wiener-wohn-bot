@@ -1,0 +1,28 @@
+# Secrets — never commit
+.env
+.envrc
+
+# Runtime state and logs
+sent_apartments.txt
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Editors
+.idea/
+.vscode/
