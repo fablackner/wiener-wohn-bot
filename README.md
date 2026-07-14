@@ -39,15 +39,13 @@ wiener-wohn-bot is a single-shot script made for cron: each run fetches the curr
 
 ## Quick start
 
-Requires Python 3.10+.
+Requires [uv](https://docs.astral.sh/uv/) (it fetches a suitable Python automatically).
 
 ```bash
 git clone https://github.com/fablackner/wiener-wohn-bot.git
 cd wiener-wohn-bot
 
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 
 cp .env.example .env
 # edit .env: at minimum the email settings, your REF_LAT/REF_LON,
@@ -59,13 +57,13 @@ cp .env.example .env
 Then test it without sending anything:
 
 ```bash
-python main.py --dry-run   # prints email previews, sends nothing, writes no state
+uv run main.py --dry-run   # prints email previews, sends nothing, writes no state
 ```
 
 And run it for real:
 
 ```bash
-python main.py             # emails every new apartment, remembers what it sent
+uv run main.py             # emails every new apartment, remembers what it sent
 ```
 
 ## Automate with cron
