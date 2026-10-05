@@ -1,6 +1,6 @@
 # wiener-wohn-bot 🏠
 
-**Email notifications for new [Wohnberatung Wien / Wiener Wohnen](https://wohnungssuche.wohnberatung-wien.at/) apartment listings.**
+**Email notifications for new [Mein Wiener Wohn-Ticket](https://www.meinwohnticket.wien/) (Wohnberatung Wien / Wiener Wohnen) apartment listings.**
 
 Vienna's subsidized-housing search has no notification service, so the only way to stay up to date is to keep opening the website and checking by hand. wiener-wohn-bot does that polling for you: it emails you every **new** apartment with a readable summary and the distance to a point you care about (your work, your family, …), and can optionally score each apartment with Gemini AI. Purely a convenience — the apartments aren't assigned first-come-first-served, this just saves you the routine of checking the page.
 
@@ -14,7 +14,7 @@ Subject: Wohnung 1220 Wien, Beispielgasse 12 | Score 87
 SCORE: 87
 Große, helle Wohnung im 4. Stock mit Loggia, nur 1,2 km vom Referenzpunkt entfernt.
 
-URL: https://wohnungssuche.wohnberatung-wien.at/?page=wohnung&id=...
+URL: https://www.meinwohnticket.wien/wohnungen/...
 Location URL: https://www.google.com/maps/place/...
 Distance to Reference (m): 1200
 1220 Wien, Beispielgasse 12
@@ -31,7 +31,7 @@ wiener-wohn-bot is a single-shot script made for cron: each run fetches the curr
 | Module | Purpose |
 |--------|---------|
 | `main.py` | Single-shot run: process only apartments not yet emailed. |
-| `scraper.py` | Fetches the listing and apartment detail pages; parses them. |
+| `scraper.py` | Queries the site's GraphQL API for search results and apartment details; parses them; geocodes addresses. |
 | `summary.py` | Builds a readable summary and computes the distance to your reference point. |
 | `ai_client.py` | Optional Gemini-based 0–100 scoring with a short evaluation. |
 | `emailer.py` | Sends notification and error emails via SMTP. |
@@ -49,10 +49,14 @@ uv sync
 
 cp .env.example .env
 # edit .env: at minimum the email settings, your REF_LAT/REF_LON,
-# and your session cookies (see below)
+# your SEARCH_URL and your session cookie (see below)
 ```
 
-**Session cookies:** the search results are only visible when logged in, so the bot reuses your browser session. Log in at [wohnungssuche.wohnberatung-wien.at](https://wohnungssuche.wohnberatung-wien.at/), open the developer tools (F12 → Application/Storage → Cookies), and copy `PHPSESSID` and `StickySession` into `WB_COOKIE_PHPSESSID` and `WB_COOKIE_StickySession` in your `.env`. When the session expires, the bot finds 0 apartments and logs a warning — log in again and refresh the values.
+**Search URL:** set up your filters (district, size, rooms, costs, …) at [meinwohnticket.wien/wohnungen](https://www.meinwohnticket.wien/wohnungen) and paste the URL from the address bar into `SEARCH_URL`. The bot reads the filters from it.
+
+**Session cookie:** the search results are only visible when logged in, so the bot reuses your browser session. Log in at [meinwohnticket.wien](https://www.meinwohnticket.wien/), open the developer tools (F12 → Application/Storage → Cookies), and copy the value of `wswinteressentenportalSessionCookiewwwmeinwohnticketwien` into `WB_SESSION_COOKIE` in your `.env`. When the session expires, the bot finds 0 apartments and logs a warning — log in again and refresh the value.
+
+**Distance:** the site doesn't publish coordinates, so the bot looks up each address with the City of Vienna's open-data address service ([data.wien.gv.at](https://data.wien.gv.at/)).
 
 Then test it without sending anything:
 
@@ -87,7 +91,8 @@ Everything is set in `.env` — see [`.env.example`](.env.example) for the full 
 | `REF_LAT`, `REF_LON` | Your reference point for the distance shown in every email. Defaults to Stephansplatz. |
 | `ENABLE_AI`, `GEMINI_API_KEY` | Optional AI scoring (free API key from [Google AI Studio](https://aistudio.google.com/apikey)). Without it, emails simply show "Score n/a". |
 | `APT_EVAL_BASE_PROMPT` | The scoring prompt — describe what *you* care about in an apartment. |
-| `WB_COOKIE_*` | Session cookies from your logged-in browser session; required to see search results and for auto-application. |
+| `SEARCH_URL` | Your filtered search URL from meinwohnticket.wien. |
+| `WB_SESSION_COOKIE` | Session cookie from your logged-in browser session; required to see search results and for auto-application. |
 
 ### AI scoring (optional)
 
@@ -101,7 +106,7 @@ Wohnberatung Wien lets you have **three** active applications at a time. With `A
 - larger than `AUTO_MIN_SIZE_SQM` m²
 - at least on floor `AUTO_MIN_FLOOR_LEVEL`
 
-If `CANCEL_APPLICATION_APT_ID` is set, the bot first cancels this existing application for that apartment (once per run) before applying to the new one.
+If `CANCEL_APPLICATION_APT_ID` is set (the UUID from the apartment's URL, `meinwohnticket.wien/wohnungen/<UUID>`), the bot first cancels your existing application for that apartment (once per run) before applying to the new one.
 
 **Be aware:** this performs real actions on your account using your session cookies. It's off by default — test with `--dry-run` and generous criteria first, and check `logfile.log` to see what would have triggered.
 
@@ -111,7 +116,7 @@ Sent apartment IDs live in `sent_apartments.txt`, one per line. Delete a line to
 
 ## Disclaimer
 
-This is an unofficial hobby project, not affiliated with or endorsed by Wohnberatung Wien or the City of Vienna. It politely scrapes the website (one listing request plus one request per *new* apartment, with a configurable delay). Use it responsibly and at your own risk — especially the automatic application feature. The website may change at any time and break the parser.
+This is an unofficial hobby project, not affiliated with or endorsed by Wohnberatung Wien or the City of Vienna. It politely queries the website (one search request per 24 results plus one detail request per *new* apartment, with a configurable delay). Use it responsibly and at your own risk — especially the automatic application feature. The website may change at any time and break the parser.
 
 ## License
 

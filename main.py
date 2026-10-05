@@ -30,13 +30,13 @@ from config import (
     AUTO_MIN_SIZE_SQM,
     AUTO_MIN_FLOOR_LEVEL,
     CANCEL_APPLICATION_APT_ID,
-    get_cookies,
 )
 from scraper import (
     fetch_apartments,
     fetch_apartment_detail,
-    parse_apartment_detail_html,
-    DEFAULT_HEADERS,
+    parse_apartment_detail,
+    apply_for_apartment,
+    cancel_application,
 )
 from summary import (
     build_apartment_summary,
@@ -167,10 +167,10 @@ def process_new_once(
         apt = id_to_apartment[apt_id]
         if not fetch_apartment_detail(apt, session=session, delay=detail_delay):
             continue
-        if not apt.detail_html:
+        if not apt.detail:
             continue
         try:
-            parsed = parse_apartment_detail_html(apt.detail_html)
+            parsed = parse_apartment_detail(apt.detail)
             summary_dict = build_apartment_summary(parsed)
             location_url = parsed.get('location') or ''
             distance_m = distance_from_reference(location_url) if location_url else None
@@ -243,48 +243,12 @@ def process_new_once(
                             and CANCEL_APPLICATION_APT_ID
                             and CANCEL_APPLICATION_APT_ID != apt.apt_id
                         ):
-                            cancel_url = (
-                                f"https://wohnungssuche.wohnberatung-wien.at/?page=wohnung&id={CANCEL_APPLICATION_APT_ID}&delete_confirm=true"
-                            )
-                            try:
-                                cookies = get_cookies()
-                                if not cookies:
-                                    logging.warning("Cancel request configured but no cookies set; request may not be authenticated")
-                                headers = dict(DEFAULT_HEADERS)
-                                headers.setdefault('Upgrade-Insecure-Requests', '1')
-                                # Use the canceled apartment as referer
-                                headers['Referer'] = f"https://wohnungssuche.wohnberatung-wien.at/?page=wohnung&id={CANCEL_APPLICATION_APT_ID}"
-                                r = session.get(cancel_url, headers=headers, cookies=cookies, timeout=30, allow_redirects=True)
-                                print(
-                                    f"Cancel-application GET status {r.status_code} for {CANCEL_APPLICATION_APT_ID}"
-                                )
-                                logging.info(
-                                    "Cancel application for %s status=%s final_url=%s redirects=%d",
-                                    CANCEL_APPLICATION_APT_ID, r.status_code, getattr(r, 'url', ''), len(getattr(r, 'history', []))
-                                )
-                                cancel_attempted = True
-                                # No success heuristic; rely on status/logs only.
-                            except Exception as e:  # pragma: no cover
-                                cancel_attempted = True
-                                logging.error("Cancel application request failed for %s: %s", CANCEL_APPLICATION_APT_ID, e)
+                            ok = cancel_application(CANCEL_APPLICATION_APT_ID, session=session)
+                            print(f"Cancel application for {CANCEL_APPLICATION_APT_ID}: {'ok' if ok else 'FAILED'}")
+                            cancel_attempted = True
 
-                        apply_url = f"https://wohnungssuche.wohnberatung-wien.at/?page=wohnung&id={apt.apt_id}&anmelden_confirm=true"
-                        try:
-                            cookies = get_cookies()
-                            if not cookies:
-                                logging.warning("Auto application enabled but no cookies set; request may not be authenticated")
-                            headers = dict(DEFAULT_HEADERS)
-                            # Some servers check Referer/Upgrade-Insecure-Requests like browsers
-                            headers.setdefault('Upgrade-Insecure-Requests', '1')
-                            headers['Referer'] = apt.absolute_url
-                            r = session.get(apply_url, headers=headers, cookies=cookies, timeout=30, allow_redirects=True)
-                            print(f"Auto-application GET status {r.status_code} for {apt.apt_id}")
-                            logging.info(
-                                "Auto application for %s status=%s final_url=%s redirects=%d",
-                                apt.apt_id, r.status_code, getattr(r, 'url', ''), len(getattr(r, 'history', []))
-                            )
-                        except Exception as e:  # pragma: no cover
-                            logging.error("Auto application request failed for %s: %s", apt.apt_id, e)
+                        ok = apply_for_apartment(apt.apt_id, session=session)
+                        print(f"Auto application for {apt.apt_id}: {'ok' if ok else 'FAILED'}")
                     else:
                         logging.info(
                             "Auto application skipped for %s (distance_ok=%s, size_ok=%s, floor_ok=%s, distance=%s, size=%s, floor=%s)",

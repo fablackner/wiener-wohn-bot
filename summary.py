@@ -1,7 +1,7 @@
 """Apartment summary builder.
 
 Provides `build_apartment_summary(parsed_dict)` which formats the parsed
-apartment detail dictionary (as returned by `parse_apartment_detail_html`),
+apartment detail dictionary (as returned by `parse_apartment_detail`),
 plus helpers to compute the distance from the configured reference point.
 """
 from __future__ import annotations

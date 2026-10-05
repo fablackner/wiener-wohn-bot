@@ -1,114 +1,144 @@
-"""Web scraping module for wiener-wohn-bot.
+"""Data access module for wiener-wohn-bot.
+
+The site (meinwohnticket.wien) is a single-page app backed by several GraphQL
+services under ``/api/<service>/graphql``. All of them require a logged-in
+session cookie.
 
 Public API:
-        - :class:`Apartment`: metadata + full HTML (if fetched)
-        - :func:`fetch_apartments`: returns a list of Apartment objects; by default fetches each
-            apartment's detail HTML so downstream code can parse freely.
-        - :func:`parse_apartment_detail_html`: extracts structured fields from a detail page.
+        - :class:`Apartment`: metadata + raw detail data (if fetched)
+        - :func:`fetch_apartments`: returns all apartments matching the configured search URL.
+        - :func:`fetch_apartment_detail`: fetches the detail data for one apartment.
+        - :func:`parse_apartment_detail`: turns the detail data into labelled, human readable fields.
+        - :func:`apply_for_apartment` / :func:`cancel_application`: register / withdraw interest.
 """
 from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Iterable, Tuple
-import re
-from urllib.parse import urljoin
+from typing import Any, Optional, Dict, List, Tuple
+from urllib.parse import urlparse, parse_qs
 import requests
-from bs4 import BeautifulSoup
 
-from config import URL, get_cookies
+from config import BASE_URL, SEARCH_URL, get_cookies
 
 DEFAULT_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept": "*/*",
     "Accept-Language": "en-US,en-AT;q=0.9,en;q=0.8,de;q=0.7",
-    "Connection": "keep-alive",
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Content-Type": "application/json",
+    "Origin": BASE_URL,
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
 }
 
-def _build_cookies():
-    cookies = get_cookies()
-    if cookies:
-        logging.debug("Using %d cookie(s) for request: %s", len(cookies), list(cookies.keys()))
-    else:
-        logging.debug("No cookies provided; proceeding without session cookies")
-    return cookies
+GEOCODER_URL = "https://data.wien.gv.at/daten/OGDAddressService.svc/GetAddressInfo"
+SEARCH_PAGE_SIZE = 24
+
+
+class SessionExpiredError(RuntimeError):
+    """Raised when the API answers with the login page instead of JSON."""
+
+
+class GraphQLError(RuntimeError):
+    """Raised when the API returns GraphQL errors."""
+
 
 @dataclass
 class Apartment:
     """Represents a single apartment listing reference.
 
     Attributes:
-        apt_id: The opaque ID value from the query string.
-        relative_url: The relative URL as found on the search page (e.g. '/?page=wohnung&id=...').
-        absolute_url: Fully qualified URL.
-        detail_html: (Optional) Full HTML of the apartment detail page if fetched.
+        apt_id: The apartment's UUID (``angebotUuid``).
+        absolute_url: Fully qualified URL of the apartment's page.
+        detail: (Optional) Raw detail data as returned by the API if fetched.
     """
     apt_id: str
-    relative_url: str
     absolute_url: str
-    detail_html: Optional[str] = None
+    detail: Optional[Dict[str, Any]] = None
 
 
-def _fetch_listing_page(session: requests.Session) -> str:
-    """Retrieve the raw HTML for the search results page."""
-    logging.info("Fetching apartment search results page ...")
-    response = session.get(URL, headers=DEFAULT_HEADERS, cookies=_build_cookies(), timeout=30)
-    logging.debug("Listing page status %s", response.status_code)
+def _graphql(session: requests.Session, service: str, operation: str, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+    """POST a GraphQL operation to ``/api/<service>/graphql`` and return its ``data``."""
+    url = f"{BASE_URL}/api/{service}/graphql"
+    payload = {"operationName": operation, "variables": variables, "query": query}
+    headers = dict(DEFAULT_HEADERS)
+    headers["Referer"] = BASE_URL + "/"
+    response = session.post(url, json=payload, headers=headers, cookies=get_cookies(), timeout=30)
+    logging.debug("%s %s status %s", service, operation, response.status_code)
     response.raise_for_status()
-    return response.text
-
-
-################################################################################
-# Core logic: extract links & fetch details
-################################################################################
-_APT_LINK_REGEX = re.compile(r"^/\?page=wohnung&id=([a-fA-F0-9]{32})$")
-
-
-def _extract_apartment_links(html: str, base_url: str) -> List[Apartment]:
-    """Parse all unique apartment links from the search results HTML.
-
-    The site presents multiple anchor tags that match the pattern '/?page=wohnung&id=<32hex>'.
-    We de-duplicate by the extracted 32-char hex ID.
-    """
-    soup = BeautifulSoup(html, 'html.parser')
-    apartments: Dict[str, Apartment] = {}
-    for a in soup.find_all('a', href=True):
-        m = _APT_LINK_REGEX.match(a['href'])
-        if not m:
-            continue
-        apt_id = m.group(1)
-        if apt_id in apartments:
-            continue  # already captured
-        absolute = urljoin(base_url, a['href'])
-        apartments[apt_id] = Apartment(
-            apt_id=apt_id,
-            relative_url=a['href'],
-            absolute_url=absolute,
+    if "json" not in response.headers.get("Content-Type", ""):
+        # Unauthenticated requests get redirected to the HTML login portal
+        raise SessionExpiredError(
+            "The site returned its login page instead of data; your session cookie is "
+            f"missing or expired. Log in at {BASE_URL} in your browser and update "
+            "WB_SESSION_COOKIE in .env."
         )
-    logging.info("Extracted %d unique apartment link(s)", len(apartments))
-    return list(apartments.values())
+    body = response.json()
+    if body.get("errors"):
+        messages = "; ".join(str(e.get("message")) for e in body["errors"])
+        raise GraphQLError(f"{operation}: {messages}")
+    return body.get("data") or {}
 
 
-def _fetch_apartment_details(apartments: Iterable[Apartment], session: requests.Session, headers: Dict[str, str], cookies: Dict[str, str], delay: float = 0.0) -> None:
-    """Populate each apartment object's ``detail_html`` in-place.
+################################################################################
+# Search
+################################################################################
+_SEARCH_QUERY = """
+query searchWohnungen($filter: WohnungSearchFilter, $page: Page!) {
+  searchWohnungen(filter: $filter, page: $page) {
+    totalHits
+    hits {
+      angebotUuid
+    }
+  }
+}
+"""
 
-    Parameters:
-        apartments: Iterable of Apartment objects to enrich.
-        session: requests.Session to reuse TCP connection + cookies.
-        headers: HTTP headers to send.
-        cookies: Cookies for auth / session.
-        delay: Optional sleep (seconds) between requests to be polite.
+# URL query parameter -> filter field (list parameters are '~' separated)
+_LIST_PARAMS = {
+    "ausstattung": "ausstattung",
+    "bezirke": "bezirke",
+    "foerderungen": "foerderungen",
+    "freiflaechen": "freiflaechen",
+    "nutzung": "nutzung",
+    "wohnungsarten": "wohnungsarten",
+}
+# URL query parameter -> filter field (range parameters look like 'min-max', either side optional)
+_RANGE_PARAMS = {
+    "anzahlRaeume": "anzahlRaeume",
+    "flaeche": "qmZinsflaeche",
+    "monatlicheKosten": "mieteGesamt",
+    "einmaligeKosten": "einmaligeKosten",
+}
+
+
+def _parse_range(value: str) -> Dict[str, float]:
+    low, _, high = value.partition("-")
+    result: Dict[str, float] = {}
+    for key, part in (("min", low), ("max", high)):
+        part = part.strip()
+        if part:
+            number = float(part)
+            result[key] = int(number) if number.is_integer() else number
+    return result
+
+
+def search_filter_from_url(url: str) -> Dict[str, Any]:
+    """Translate a meinwohnticket.wien search URL into the API's search filter.
+
+    Example: '.../wohnungen?anzahlRaeume=3-7&bezirke=1010~1220&flaeche=65-'
     """
-    for idx, apt in enumerate(apartments, start=1):
-        try:
-            logging.debug("Fetching apartment %s (%d/%d): %s", apt.apt_id, idx, len(list(apartments)), apt.absolute_url)
-            resp = session.get(apt.absolute_url, headers=headers, cookies=cookies, timeout=30)
-            resp.raise_for_status()
-            apt.detail_html = resp.text
-        except Exception as e:  # pragma: no cover - network variability
-            logging.warning("Failed to fetch detail page for %s: %s", apt.apt_id, e)
-        if delay:
-            time.sleep(delay)
+    params = {k: v[0] for k, v in parse_qs(urlparse(url).query).items() if v}
+    search_filter: Dict[str, Any] = {field: [] for field in _LIST_PARAMS.values()}
+    for param, field in _LIST_PARAMS.items():
+        if params.get(param):
+            search_filter[field] = [v for v in params[param].split("~") if v]
+    for param, field in _RANGE_PARAMS.items():
+        if params.get(param):
+            rng = _parse_range(params[param])
+            if rng:
+                search_filter[field] = rng
+    # Newest first, regardless of the sort order chosen in the browser
+    search_filter["sort"] = {"field": "ERSTELLUNGSZEITPUNKT", "direction": "DESC"}
+    return search_filter
 
 
 def fetch_apartments(
@@ -117,133 +147,303 @@ def fetch_apartments(
     session: Optional[requests.Session] = None,
     limit: Optional[int] = None,
 ) -> List[Apartment]:
-    """Return a list of apartment listings (with optional detail HTML).
+    """Return a list of apartments matching ``SEARCH_URL`` (with optional detail data).
 
     Args:
-        fetch_details: Whether to download each apartment's detail page HTML (default True).
+        fetch_details: Whether to download each apartment's detail data (default True).
         detail_delay: Sleep seconds between detail fetches (politeness / throttling).
         session: Optional requests.Session to reuse.
-        limit: Limit number of apartments (after de-duplication) for testing.
+        limit: Limit number of apartments for testing.
 
     Returns:
         List[Apartment]
     """
     sess = session or requests.Session()
-    listing_html = _fetch_listing_page(sess)
-    apartments = _extract_apartment_links(listing_html, base_url=URL)
-    if not apartments and 'einloggen' in listing_html.lower():
-        logging.warning(
-            "The site returned its login page instead of search results; "
-            "your session cookies are missing or expired. Log in at %s in your "
-            "browser and update WB_COOKIE_PHPSESSID (and WB_COOKIE_StickySession) in .env.",
-            URL,
-        )
+    search_filter = search_filter_from_url(SEARCH_URL)
+    logging.info("Fetching apartment search results ...")
+    apartments: Dict[str, Apartment] = {}
+    offset = 0
+    try:
+        while True:
+            data = _graphql(sess, "was", "searchWohnungen", _SEARCH_QUERY, {
+                "filter": search_filter,
+                "page": {"size": SEARCH_PAGE_SIZE, "offset": offset},
+            })
+            result = data.get("searchWohnungen") or {}
+            hits = result.get("hits") or []
+            for hit in hits:
+                apt_id = hit["angebotUuid"]
+                apartments.setdefault(apt_id, Apartment(apt_id=apt_id, absolute_url=f"{BASE_URL}/wohnungen/{apt_id}"))
+            offset += len(hits)
+            if not hits or offset >= (result.get("totalHits") or 0):
+                break
+    except SessionExpiredError as e:
+        logging.warning("%s", e)
+        return []
+    logging.info("Found %d apartment(s)", len(apartments))
+    result_list = list(apartments.values())
     if limit is not None:
-        apartments = apartments[:limit]
-    if fetch_details and apartments:
-        logging.info("Fetching detail pages for %d apartment(s)...", len(apartments))
-        _fetch_apartment_details(apartments, sess, DEFAULT_HEADERS, _build_cookies(), delay=detail_delay)
-    return apartments
+        result_list = result_list[:limit]
+    if fetch_details:
+        for apt in result_list:
+            fetch_apartment_detail(apt, session=sess, delay=detail_delay)
+    return result_list
+
 
 ################################################################################
-# Parsing helpers for detail_html
+# Details
 ################################################################################
+_DETAIL_QUERY = """
+query wohnungsangebot($angebotUuid: ID!) {
+  getWohnungsangebotByUuid(angebotUuid: $angebotUuid) {
+    angebotsstatus
+    vergabetyp
+    wohnungsart
+    adresse { orientierungsnummer strasse stiege tuernummer plz }
+    wohnungDetails {
+      bezugsdatum bezugAbSofort qmZinsflaeche foerderungsart rechtsform anzahlWohnraeume
+      qmBalkonTerrasse qmLoggiaVeranda qmLoggia qmBalkon qmTerrasse qmGarten qmTerrassenanteil
+      kellerabteilVorhanden qmKeller heizwaermebedarf gesamtenergieeffizienzfaktor kategorie
+      zustand erstbezug raumhoehe nutzungsart baujahr stufenZurWohnung wohnungInErdgeschoss
+      smartZusicherung stock mehrereWohnebenen
+    }
+    kosten {
+      eigenmittelGesamt eigenmittelGrundkosten eigenmittelBaukosten par10Abloese nettoKaltmiete
+      kaufpreis kaution wohnbaufoerderung kostenNotizen betriebskosten sonstigeKosten umsatzsteuer
+      mieteGesamt erhaltungsUndVerbesserungsbeitrag parkplatzMiete gefoerderterKaufpreis
+    }
+    ausstattung
+    stiege { projektname projektwebseite }
+    bautraeger { firmenname firmenwebseite }
+  }
+}
+"""
 
-def _extract_address(soup: BeautifulSoup) -> Optional[str]:
-    # Address appears in an h2 with spans for postal code, street, etc.
-    h2 = soup.find('h2', class_='wbw-blue')
-    if not h2:
-        return None
-    text = ' '.join(h2.stripped_strings)
-    return text
 
-def _extract_table_key_values(table) -> Dict[str, str]:
-    data: Dict[str, str] = {}
-    if not table:
-        return data
-    for tr in table.find_all('tr'):
-        th = tr.find('th')
-        td = tr.find('td')
-        if not th or not td:
-            continue
-        key = ' '.join(th.stripped_strings)
-        val = ' '.join(td.stripped_strings)
-        if key:
-            data[key] = val
-    return data
+def fetch_apartment_detail(apt: Apartment, session: Optional[requests.Session] = None, delay: float = 0.0) -> bool:
+    """Fetch and populate ``apt.detail`` if not already present.
 
-def _extract_panel_table_by_heading(soup: BeautifulSoup, heading_text: str) -> Dict[str, str]:
-    # Find a panel with a heading equal to heading_text and parse first table inside
-    for panel in soup.find_all(class_='panel'):
-        head = panel.find(class_='panel-heading')
-        if not head:
-            continue
-        if heading_text.lower() in ' '.join(head.stripped_strings).lower():
-            table = panel.find('table')
-            return _extract_table_key_values(table)
-    return {}
-
-def _extract_zusatzinformation_text(soup: BeautifulSoup) -> Optional[str]:
-    """Return free-form text inside the Zusatzinformation panel (if any)."""
-    for panel in soup.find_all(class_='panel'):
-        head = panel.find(class_='panel-heading')
-        if not head:
-            continue
-        if 'zusatzinformation' in ' '.join(head.stripped_strings).lower():
-            body = panel.find(class_='panel-body')
-            if body:
-                return ' '.join(body.stripped_strings)
-    return None
-
-def _extract_google_maps_link(soup: BeautifulSoup) -> Optional[str]:
-    # The map link is inside an <a> with google.com/maps/place
-    a = soup.find('a', href=re.compile(r'google.com/maps/place'))
-    if a:
-        return a['href']
-    return None
-
-def parse_apartment_detail_html(html: str) -> Dict[str, object]:
-    """Parse an apartment detail page HTML and extract structured fields.
-
-    Returns a dict with keys: address, basisdaten, detailinformation, zusatzinformation, location
+    Returns True on success, False on failure. If detail is already populated,
+    it is left untouched and True is returned.
     """
-    soup = BeautifulSoup(html, 'html.parser')
-    address = _extract_address(soup)
-    basisdaten = _extract_panel_table_by_heading(soup, 'Basisdaten')
-    detailinformation = _extract_panel_table_by_heading(soup, 'Detailinformation')
-    zusatzinfo_table = _extract_panel_table_by_heading(soup, 'Zusatzinformation')
-    zusatzinfo_text = _extract_zusatzinformation_text(soup)
-    location = _extract_google_maps_link(soup)
+    if apt.detail is not None:
+        return True
+    sess = session or requests.Session()
+    try:
+        logging.debug("Fetching apartment detail %s", apt.apt_id)
+        data = _graphql(sess, "wav", "wohnungsangebot", _DETAIL_QUERY, {"angebotUuid": apt.apt_id})
+        apt.detail = data.get("getWohnungsangebotByUuid")
+        if delay:
+            time.sleep(delay)
+        return apt.detail is not None
+    except Exception as e:  # pragma: no cover (network variability)
+        logging.warning("Failed to fetch detail for %s: %s", apt.apt_id, e)
+        return False
+
+
+def geocode_address(street_and_number: str, plz: Optional[str] = None) -> Optional[Tuple[float, float]]:
+    """Return (lat, lon) for a Vienna address via the city's open-data address service."""
+    try:
+        resp = requests.get(GEOCODER_URL, params={"Address": street_and_number, "crs": "EPSG:4326"}, timeout=15)
+        resp.raise_for_status()
+        features = resp.json().get("features") or []
+    except Exception as e:  # pragma: no cover (network variability)
+        logging.warning("Geocoding failed for %r: %s", street_and_number, e)
+        return None
+    if plz:
+        features = [f for f in features if f.get("properties", {}).get("PostalCode") == plz] or features
+    if not features:
+        return None
+    lon, lat = features[0]["geometry"]["coordinates"][:2]
+    return lat, lon
+
+
+def _fmt_number(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{int(value):,}".replace(",", ".")
+
+
+def _fmt_euro(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _fmt_enum(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    return str(value).replace("_", " ").capitalize()
+
+
+def _fmt_bool(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return "Ja" if value else "Nein"
+
+
+def _compact(d: Dict[str, Optional[str]]) -> Dict[str, str]:
+    return {k: v for k, v in d.items() if v not in (None, "")}
+
+
+def parse_apartment_detail(detail: Dict[str, Any], geocode: bool = True) -> Dict[str, object]:
+    """Turn raw apartment detail data into labelled, human readable fields.
+
+    Returns a dict with keys: address, basisdaten, detailinformation, zusatzinformation, location.
+    ``location`` is a Google Maps link (with coordinates when geocoding succeeds).
+    """
+    adresse = detail.get("adresse") or {}
+    wd = detail.get("wohnungDetails") or {}
+    kosten = detail.get("kosten") or {}
+    ausstattung = detail.get("ausstattung") or []
+    stiege = detail.get("stiege") or {}
+    bautraeger = detail.get("bautraeger") or {}
+
+    street_and_number = " ".join(p for p in (adresse.get("strasse"), adresse.get("orientierungsnummer")) if p)
+    full_number = "/".join(str(p) for p in (adresse.get("orientierungsnummer"), adresse.get("stiege"), adresse.get("tuernummer")) if p)
+    plz = adresse.get("plz")
+    address = f"{plz or ''} Wien, {adresse.get('strasse') or ''} {full_number}".strip()
+
+    basisdaten = _compact({
+        "Größe/m²": _fmt_number(wd.get("qmZinsflaeche")),
+        "Zimmer": _fmt_number(wd.get("anzahlWohnraeume")),
+        "Monatl. Kosten": _fmt_euro(kosten.get("mieteGesamt")),
+        "Eigenmittel": _fmt_euro(kosten.get("eigenmittelGesamt")),
+        "Betriebskosten": _fmt_euro(kosten.get("betriebskosten")),
+        "Nettomiete": _fmt_euro(kosten.get("nettoKaltmiete")),
+        "Sonstige Kosten": _fmt_euro(kosten.get("sonstigeKosten")),
+        "Umsatzsteuer": _fmt_euro(kosten.get("umsatzsteuer")),
+        "EVB": _fmt_euro(kosten.get("erhaltungsUndVerbesserungsbeitrag")),
+        "Kaution": _fmt_euro(kosten.get("kaution")),
+        "Kaufpreis": _fmt_euro(kosten.get("kaufpreis") or kosten.get("gefoerderterKaufpreis")),
+        "Ablöse §10": _fmt_euro(kosten.get("par10Abloese")) if kosten.get("par10Abloese") else None,
+        "Parkplatzmiete": _fmt_euro(kosten.get("parkplatzMiete")),
+    })
+
+    freiflaechen = [
+        f"{label} {_fmt_number(wd.get(key))} m²"
+        for label, key in (
+            ("Loggia", "qmLoggia"), ("Balkon", "qmBalkon"), ("Terrasse", "qmTerrasse"),
+            ("Garten", "qmGarten"), ("Balkon/Terrasse", "qmBalkonTerrasse"),
+            ("Loggia/Veranda", "qmLoggiaVeranda"), ("Terrassenanteil", "qmTerrassenanteil"),
+        )
+        if wd.get(key)
+    ]
+    if wd.get("bezugAbSofort"):
+        bezug = "Ab sofort"
+    else:
+        bezug = wd.get("bezugsdatum")
+    stock = wd.get("stock") or ("Erdgeschoß" if wd.get("wohnungInErdgeschoss") else None)
+
+    detailinformation = _compact({
+        "Bezugsdatum": bezug,
+        "Wohnungstyp": _fmt_enum(detail.get("wohnungsart")),
+        "Wohnungskategorie": wd.get("kategorie"),
+        "Geschoß": stock,
+        "Aufzug": "Ja" if "LIFT" in ausstattung else "Nein",
+        "Freifläche": ", ".join(freiflaechen) or None,
+        "Baujahr": _fmt_number(wd.get("baujahr")),
+        "Förderungsart": _fmt_enum(wd.get("foerderungsart")),
+        "Rechtsform": _fmt_enum(wd.get("rechtsform")),
+        "Vergabetyp": _fmt_enum(detail.get("vergabetyp")),
+        "Status": _fmt_enum(detail.get("angebotsstatus")),
+        "Erstbezug": _fmt_bool(wd.get("erstbezug")),
+        "Zustand": _fmt_enum(wd.get("zustand")),
+        "Mehrere Wohnebenen": "Ja" if wd.get("mehrereWohnebenen") else None,
+        "Stufen zur Wohnung": _fmt_number(wd.get("stufenZurWohnung")),
+        "Kellerabteil": _fmt_bool(wd.get("kellerabteilVorhanden")),
+        "HWB": _fmt_number(wd.get("heizwaermebedarf")),
+        "fGEE": _fmt_number(wd.get("gesamtenergieeffizienzfaktor")),
+        "SMART-Wohnung": "Ja" if wd.get("smartZusicherung") else None,
+        "Ausstattung": ", ".join(_fmt_enum(a) for a in ausstattung) or None,
+    })
+
+    zusatzinformation = _compact({
+        "Projekt": stiege.get("projektname"),
+        "Projektwebseite": stiege.get("projektwebseite"),
+        "Bauträger": bautraeger.get("firmenname"),
+        "__text": kosten.get("kostenNotizen"),
+    })
+
+    location = None
+    if street_and_number:
+        coords = geocode_address(street_and_number, plz) if geocode else None
+        if coords:
+            location = f"https://www.google.com/maps/place/{coords[0]:.8f},{coords[1]:.8f}"
+        else:
+            query = f"{street_and_number}, {plz or ''} Wien".replace(" ", "+")
+            location = f"https://www.google.com/maps/search/?api=1&query={query}"
+
     return {
         'address': address,
         'basisdaten': basisdaten,
         'detailinformation': detailinformation,
-        'zusatzinformation': {**zusatzinfo_table, **({'__text': zusatzinfo_text} if zusatzinfo_text else {})},
+        'zusatzinformation': zusatzinformation,
         'location': location,
     }
 
-__all__ = ["Apartment", "fetch_apartments", "parse_apartment_detail_html"]
+
+################################################################################
+# Applications (Wohnungsanmeldungen)
+################################################################################
+_APPLY_MUTATION = """
+mutation addAnmeldung($angebotUuid: ID!) {
+  addAnmeldung(angebotUuid: $angebotUuid)
+}
+"""
+
+_VERGABE_QUERY = """
+query vergabe($angebotUuid: ID!) {
+  vergabe(angebotUuid: $angebotUuid) {
+    angebotUuid
+    anmeldefenster { anmeldefensterUuid }
+  }
+}
+"""
+
+_CANCEL_MUTATION = """
+mutation removeAnmeldung($angebotUuid: ID!, $anmeldefensterUuid: ID!) {
+  removeAnmeldung(angebotUuid: $angebotUuid, anmeldefensterUuid: $anmeldefensterUuid)
+}
+"""
 
 
-def fetch_apartment_detail(apt: Apartment, session: Optional[requests.Session] = None, delay: float = 0.0) -> bool:
-    """Fetch and populate the detail_html for a single Apartment if not already present.
-
-    Returns True on success, False on failure. If detail_html is already populated,
-    it is left untouched and True is returned.
-    """
-    if apt.detail_html is not None:
-        return True
+def apply_for_apartment(apt_id: str, session: Optional[requests.Session] = None) -> bool:
+    """Register interest (``Interesse anmelden``) for an apartment. Returns True on success."""
     sess = session or requests.Session()
     try:
-        logging.debug("Fetching single apartment detail %s", apt.apt_id)
-        resp = sess.get(apt.absolute_url, headers=DEFAULT_HEADERS, cookies=_build_cookies(), timeout=30)
-        resp.raise_for_status()
-        apt.detail_html = resp.text
-        if delay:
-            time.sleep(delay)
+        data = _graphql(sess, "vs", "addAnmeldung", _APPLY_MUTATION, {"angebotUuid": apt_id})
+        logging.info("Application for %s: %s", apt_id, data.get("addAnmeldung"))
         return True
     except Exception as e:  # pragma: no cover (network variability)
-        logging.warning("Failed to fetch single detail page for %s: %s", apt.apt_id, e)
+        logging.error("Application for %s failed: %s", apt_id, e)
         return False
 
-__all__.append("fetch_apartment_detail")
+
+def cancel_application(apt_id: str, session: Optional[requests.Session] = None) -> bool:
+    """Withdraw interest (``Interesse abmelden``) for an apartment. Returns True on success."""
+    sess = session or requests.Session()
+    try:
+        data = _graphql(sess, "vs", "vergabe", _VERGABE_QUERY, {"angebotUuid": apt_id})
+        fenster = ((data.get("vergabe") or {}).get("anmeldefenster") or {}).get("anmeldefensterUuid")
+        if not fenster:
+            logging.error("Cancel application for %s: no registration window found", apt_id)
+            return False
+        data = _graphql(sess, "vs", "removeAnmeldung", _CANCEL_MUTATION, {
+            "angebotUuid": apt_id,
+            "anmeldefensterUuid": fenster,
+        })
+        logging.info("Cancel application for %s: %s", apt_id, data.get("removeAnmeldung"))
+        return True
+    except Exception as e:  # pragma: no cover (network variability)
+        logging.error("Cancel application for %s failed: %s", apt_id, e)
+        return False
+
+
+__all__ = [
+    "Apartment", "SessionExpiredError", "GraphQLError", "fetch_apartments", "fetch_apartment_detail",
+    "parse_apartment_detail", "search_filter_from_url", "geocode_address",
+    "apply_for_apartment", "cancel_application",
+]

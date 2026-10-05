@@ -12,7 +12,9 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent / '.env', override=False)
 
 # Scraper settings
-URL = 'https://wohnungssuche.wohnberatung-wien.at/?page=suche&art=gefoerdert'
+BASE_URL = 'https://www.meinwohnticket.wien'
+# Paste the URL of your filtered search from the browser here (filters are read from it)
+SEARCH_URL = os.getenv('SEARCH_URL', '').strip() or f'{BASE_URL}/wohnungen'
 SENT_IDS_FILE = os.getenv('SENT_IDS_FILE', 'sent_apartments.txt')
 DETAIL_DELAY = float(os.getenv('DETAIL_DELAY', '0.3'))
 
@@ -56,14 +58,13 @@ AUTO_MAX_DISTANCE_M = int(os.getenv('AUTO_MAX_DISTANCE_M', '3000'))
 AUTO_MIN_SIZE_SQM = float(os.getenv('AUTO_MIN_SIZE_SQM', '74'))
 AUTO_MIN_FLOOR_LEVEL = int(os.getenv('AUTO_MIN_FLOOR_LEVEL', '3'))
 
-# Optional: If set, cancel an existing application for this apartment ID
+# Optional: If set, cancel an existing application for this apartment ID (UUID)
 # before submitting a new automatic application.
 CANCEL_APPLICATION_APT_ID = os.getenv('CANCEL_APPLICATION_APT_ID', '').strip()
 
-# Cookies (optional, some pages may need a session to show full results)
-WB_COOKIE_PHPSESSID = os.getenv('WB_COOKIE_PHPSESSID', '').strip()
-WB_COOKIE_StickySession = os.getenv('WB_COOKIE_StickySession', '').strip()
-WB_COOKIE_CC_COOKIE = os.getenv('WB_COOKIE_CC_COOKIE', '').strip()  # keep raw JSON string
+# Session cookie of a logged-in browser session (required to see search results)
+SESSION_COOKIE_NAME = 'wswinteressentenportalSessionCookiewwwmeinwohnticketwien'
+WB_SESSION_COOKIE = os.getenv('WB_SESSION_COOKIE', '').strip()
 
 
 def get_cookies():
@@ -72,12 +73,8 @@ def get_cookies():
     This keeps requests flexible: if no cookies provided, request goes without them.
     """
     cookies = {}
-    if WB_COOKIE_PHPSESSID:
-        cookies['PHPSESSID'] = WB_COOKIE_PHPSESSID
-    if WB_COOKIE_StickySession:
-        cookies['StickySession'] = WB_COOKIE_StickySession
-    if WB_COOKIE_CC_COOKIE:
-        cookies['cc_cookie'] = WB_COOKIE_CC_COOKIE
+    if WB_SESSION_COOKIE:
+        cookies[SESSION_COOKIE_NAME] = WB_SESSION_COOKIE
     return cookies
 
 
@@ -96,7 +93,7 @@ def validate_config():
         raise ValueError('ENABLE_AI=1 but GEMINI_API_KEY is not set')
 
 __all__ = [
-    'URL','SENT_IDS_FILE','DETAIL_DELAY','EMAIL_SENDER','EMAIL_PASSWORD','EMAIL_RECIPIENTS',
+    'BASE_URL','SEARCH_URL','SENT_IDS_FILE','DETAIL_DELAY','EMAIL_SENDER','EMAIL_PASSWORD','EMAIL_RECIPIENTS',
     'SMTP_SERVER','SMTP_PORT','GEMINI_API_KEY','GEMINI_MODEL','APT_EVAL_BASE_PROMPT','ENABLE_AI',
     'AUTOMATIC_APPLICATION','AUTO_MAX_DISTANCE_M',
     'AUTO_MIN_SIZE_SQM','AUTO_MIN_FLOOR_LEVEL','CANCEL_APPLICATION_APT_ID','LOG_FILE','LOG_LEVEL',
