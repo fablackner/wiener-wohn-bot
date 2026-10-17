@@ -23,6 +23,8 @@ from config import (
     LOG_FILE,
     LOG_LEVEL,
     SENT_IDS_FILE,
+    SESSION_EXPIRED_FLAG_FILE,
+    EMAIL_RECIPIENTS,
     DETAIL_DELAY,
     validate_config,
     AUTOMATIC_APPLICATION,
@@ -37,6 +39,7 @@ from scraper import (
     parse_apartment_detail,
     apply_for_apartment,
     cancel_application,
+    SessionExpiredError,
 )
 from summary import (
     build_apartment_summary,
@@ -138,6 +141,21 @@ def _parse_floor_level(value: Optional[str]) -> Optional[int]:
         return None
 
 
+def notify_session_expired(message: str, flag_file: str | Path) -> None:
+    """Email the first recipient once per expiry; the flag file suppresses repeats."""
+    flag = Path(flag_file)
+    if flag.exists():
+        return
+    send_email(
+        "wiener-wohn-bot: Session abgelaufen",
+        "Das Session-Cookie für meinwohnticket.wien ist abgelaufen. Bis es erneuert ist, "
+        "findet der Bot keine Wohnungen und bewirbt sich nicht automatisch.\n\n"
+        f"{message}\n",
+        EMAIL_RECIPIENTS[:1],
+    )
+    flag.touch()
+
+
 def process_new_once(
     *,
     state_file: str | Path,
@@ -151,7 +169,15 @@ def process_new_once(
     # Reuse a single HTTP session for consistent cookies/headers
     session = requests.Session()
     # Fetch listing with IDs only for speed
-    apartments = fetch_apartments(fetch_details=False, session=session)
+    try:
+        apartments = fetch_apartments(fetch_details=False, session=session)
+    except SessionExpiredError as e:
+        logging.warning("%s", e)
+        if not dry_run:
+            notify_session_expired(str(e), SESSION_EXPIRED_FLAG_FILE)
+        return 0
+    # Session works again: allow the next expiry to be notified
+    Path(SESSION_EXPIRED_FLAG_FILE).unlink(missing_ok=True)
     id_to_apartment = {a.apt_id: a for a in apartments}
 
     sent_ids = load_sent_ids(state_file)

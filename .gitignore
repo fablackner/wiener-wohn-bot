@@ -4,6 +4,7 @@
 
 # Runtime state and logs
 sent_apartments.txt
+session_expired.flag
 *.log
 
 # Python

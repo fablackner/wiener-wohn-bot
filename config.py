@@ -16,6 +16,8 @@ BASE_URL = 'https://www.meinwohnticket.wien'
 # Paste the URL of your filtered search from the browser here (filters are read from it)
 SEARCH_URL = os.getenv('SEARCH_URL', '').strip() or f'{BASE_URL}/wohnungen'
 SENT_IDS_FILE = os.getenv('SENT_IDS_FILE', 'sent_apartments.txt')
+# Marker file so the session-expired email is sent only once per expiry
+SESSION_EXPIRED_FLAG_FILE = os.getenv('SESSION_EXPIRED_FLAG_FILE', 'session_expired.flag')
 DETAIL_DELAY = float(os.getenv('DETAIL_DELAY', '0.3'))
 
 # Email settings
@@ -93,7 +95,7 @@ def validate_config():
         raise ValueError('ENABLE_AI=1 but GEMINI_API_KEY is not set')
 
 __all__ = [
-    'BASE_URL','SEARCH_URL','SENT_IDS_FILE','DETAIL_DELAY','EMAIL_SENDER','EMAIL_PASSWORD','EMAIL_RECIPIENTS',
+    'BASE_URL','SEARCH_URL','SENT_IDS_FILE','SESSION_EXPIRED_FLAG_FILE','DETAIL_DELAY','EMAIL_SENDER','EMAIL_PASSWORD','EMAIL_RECIPIENTS',
     'SMTP_SERVER','SMTP_PORT','GEMINI_API_KEY','GEMINI_MODEL','APT_EVAL_BASE_PROMPT','ENABLE_AI',
     'AUTOMATIC_APPLICATION','AUTO_MAX_DISTANCE_M',
     'AUTO_MIN_SIZE_SQM','AUTO_MIN_FLOOR_LEVEL','CANCEL_APPLICATION_APT_ID','LOG_FILE','LOG_LEVEL',

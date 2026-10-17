@@ -136,8 +136,6 @@ def search_filter_from_url(url: str) -> Dict[str, Any]:
             rng = _parse_range(params[param])
             if rng:
                 search_filter[field] = rng
-    # Newest first, regardless of the sort order chosen in the browser
-    search_filter["sort"] = {"field": "ERSTELLUNGSZEITPUNKT", "direction": "DESC"}
     return search_filter
 
 
@@ -157,29 +155,28 @@ def fetch_apartments(
 
     Returns:
         List[Apartment]
+
+    Raises:
+        SessionExpiredError: If the session cookie is missing or expired.
     """
     sess = session or requests.Session()
     search_filter = search_filter_from_url(SEARCH_URL)
     logging.info("Fetching apartment search results ...")
     apartments: Dict[str, Apartment] = {}
     offset = 0
-    try:
-        while True:
-            data = _graphql(sess, "was", "searchWohnungen", _SEARCH_QUERY, {
-                "filter": search_filter,
-                "page": {"size": SEARCH_PAGE_SIZE, "offset": offset},
-            })
-            result = data.get("searchWohnungen") or {}
-            hits = result.get("hits") or []
-            for hit in hits:
-                apt_id = hit["angebotUuid"]
-                apartments.setdefault(apt_id, Apartment(apt_id=apt_id, absolute_url=f"{BASE_URL}/wohnungen/{apt_id}"))
-            offset += len(hits)
-            if not hits or offset >= (result.get("totalHits") or 0):
-                break
-    except SessionExpiredError as e:
-        logging.warning("%s", e)
-        return []
+    while True:
+        data = _graphql(sess, "was", "searchWohnungen", _SEARCH_QUERY, {
+            "filter": search_filter,
+            "page": {"size": SEARCH_PAGE_SIZE, "offset": offset},
+        })
+        result = data.get("searchWohnungen") or {}
+        hits = result.get("hits") or []
+        for hit in hits:
+            apt_id = hit["angebotUuid"]
+            apartments.setdefault(apt_id, Apartment(apt_id=apt_id, absolute_url=f"{BASE_URL}/wohnungen/{apt_id}"))
+        offset += len(hits)
+        if not hits or offset >= (result.get("totalHits") or 0):
+            break
     logging.info("Found %d apartment(s)", len(apartments))
     result_list = list(apartments.values())
     if limit is not None:

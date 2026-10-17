@@ -54,7 +54,7 @@ cp .env.example .env
 
 **Search URL:** set up your filters (district, size, rooms, costs, …) at [meinwohnticket.wien/wohnungen](https://www.meinwohnticket.wien/wohnungen) and paste the URL from the address bar into `SEARCH_URL`. The bot reads the filters from it.
 
-**Session cookie:** the search results are only visible when logged in, so the bot reuses your browser session. Log in at [meinwohnticket.wien](https://www.meinwohnticket.wien/), open the developer tools (F12 → Application/Storage → Cookies), and copy the value of `wswinteressentenportalSessionCookiewwwmeinwohnticketwien` into `WB_SESSION_COOKIE` in your `.env`. When the session expires, the bot finds 0 apartments and logs a warning — log in again and refresh the value.
+**Session cookie:** the search results are only visible when logged in, so the bot reuses your browser session. Log in at [meinwohnticket.wien](https://www.meinwohnticket.wien/), open the developer tools (F12 → Application/Storage → Cookies), and copy the value of `wswinteressentenportalSessionCookiewwwmeinwohnticketwien` into `WB_SESSION_COOKIE` in your `.env`. When the session expires, the bot finds 0 apartments, logs a warning and emails the first address in `EMAIL_RECIPIENTS` (once per expiry) — log in again and refresh the value.
 
 **Distance:** the site doesn't publish coordinates, so the bot looks up each address with the City of Vienna's open-data address service ([data.wien.gv.at](https://data.wien.gv.at/)).
 
