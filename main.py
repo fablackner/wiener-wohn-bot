@@ -1,9 +1,10 @@
 """wiener-wohn-bot CLI: single-shot run that processes only new apartments.
 
-This utility is designed for cron. It will:
-  1) Fetch current apartment listing (IDs only)
+This utility is designed for cron / GitHub Actions. It will:
+  1) Log in and fetch the current apartment listing (IDs only)
   2) Compare with the sent IDs file
-  3) For each NEW ID: fetch detail HTML, build summary, evaluate AI score, send email
+  3) For each NEW ID: fetch details, build summary, evaluate AI score, send notification
+     (Telegram and/or email)
   4) Append processed IDs to the sent IDs file
 
 Exit codes:
@@ -23,8 +24,6 @@ from config import (
     LOG_FILE,
     LOG_LEVEL,
     SENT_IDS_FILE,
-    SESSION_EXPIRED_FLAG_FILE,
-    EMAIL_RECIPIENTS,
     DETAIL_DELAY,
     validate_config,
     AUTOMATIC_APPLICATION,
@@ -39,21 +38,20 @@ from scraper import (
     parse_apartment_detail,
     apply_for_apartment,
     cancel_application,
-    SessionExpiredError,
 )
 from summary import (
     build_apartment_summary,
     distance_from_reference,
 )
 from ai_client import evaluate_full_email
-from emailer import send_email, send_error
+from notifier import notify, notify_error
 import requests
 
 
 def setup_logging(log_level: str) -> None:
     level = getattr(logging, log_level.upper(), logging.INFO)
     logging.basicConfig(
-        filename=LOG_FILE,
+        filename=LOG_FILE or None,  # empty -> stderr
         level=level,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
@@ -74,6 +72,7 @@ def append_sent_ids(path: str | Path, new_ids: List[str]) -> None:
     if not new_ids:
         return
     try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         with Path(path).open('a') as f:
             for _id in new_ids:
                 f.write(_id + '\n')
@@ -81,14 +80,14 @@ def append_sent_ids(path: str | Path, new_ids: List[str]) -> None:
         logging.error("Failed to append sent IDs: %s", e)
 
 
-def build_email_body(
+def build_message_body(
     absolute_url: str,
     parsed: dict,
     *,
     summary_dict: Optional[dict[str, str]] = None,
     distance_m: Optional[int] = None,
 ) -> str:
-    """Return the email body for an apartment.
+    """Return the notification body for an apartment.
 
     Includes URL, location URL and distance (if available), followed by the
     summary fields (Address as a standalone line). Raw coordinates and the
@@ -141,43 +140,24 @@ def _parse_floor_level(value: Optional[str]) -> Optional[int]:
         return None
 
 
-def notify_session_expired(message: str, flag_file: str | Path) -> None:
-    """Email the first recipient once per expiry; the flag file suppresses repeats."""
-    flag = Path(flag_file)
-    if flag.exists():
-        return
-    send_email(
-        "wiener-wohn-bot: Session abgelaufen",
-        "Das Session-Cookie für meinwohnticket.wien ist abgelaufen. Bis es erneuert ist, "
-        "findet der Bot keine Wohnungen und bewirbt sich nicht automatisch.\n\n"
-        f"{message}\n",
-        EMAIL_RECIPIENTS[:1],
-    )
-    flag.touch()
-
-
 def process_new_once(
     *,
     state_file: str | Path,
     detail_delay: float,
     dry_run: bool,
+    mark_seen: bool = False,
 ) -> int:
     """Process newly discovered apartments exactly once.
 
-    Returns the number of new apartments processed (emailed or previewed).
+    With ``mark_seen``, new apartments are only recorded as sent (no details,
+    notifications or applications) — useful to seed the state file.
+
+    Returns the number of new apartments processed (notified, previewed or marked).
     """
     # Reuse a single HTTP session for consistent cookies/headers
     session = requests.Session()
     # Fetch listing with IDs only for speed
-    try:
-        apartments = fetch_apartments(fetch_details=False, session=session)
-    except SessionExpiredError as e:
-        logging.warning("%s", e)
-        if not dry_run:
-            notify_session_expired(str(e), SESSION_EXPIRED_FLAG_FILE)
-        return 0
-    # Session works again: allow the next expiry to be notified
-    Path(SESSION_EXPIRED_FLAG_FILE).unlink(missing_ok=True)
+    apartments = fetch_apartments(fetch_details=False, session=session)
     id_to_apartment = {a.apt_id: a for a in apartments}
 
     sent_ids = load_sent_ids(state_file)
@@ -186,6 +166,11 @@ def process_new_once(
     if not new_ids:
         logging.info("No new apartments to process.")
         return 0
+
+    if mark_seen:
+        if not dry_run:
+            append_sent_ids(state_file, new_ids)
+        return len(new_ids)
 
     processed: List[str] = []
     cancel_attempted = False  # ensure we cancel at most once per run
@@ -200,7 +185,7 @@ def process_new_once(
             summary_dict = build_apartment_summary(parsed)
             location_url = parsed.get('location') or ''
             distance_m = distance_from_reference(location_url) if location_url else None
-            base_body = build_email_body(
+            base_body = build_message_body(
                 apt.absolute_url,
                 parsed,
                 summary_dict=summary_dict,
@@ -233,13 +218,13 @@ def process_new_once(
                 subject = f"Wohnung {address} | Score n/a"
 
             if dry_run:
-                print("\n--- EMAIL PREVIEW BEGIN ---")
+                print("\n--- MESSAGE PREVIEW BEGIN ---")
                 print(f"Subject: {subject}")
                 print(final_body)
-                print("--- EMAIL PREVIEW END ---\n")
+                print("--- MESSAGE PREVIEW END ---\n")
                 processed.append(apt_id)
             else:
-                send_email(subject, final_body)
+                notify(subject, final_body)
                 processed.append(apt_id)
                 # Conditional automatic application trigger (no-op in dry-run)
                 size_text = (
@@ -298,7 +283,9 @@ def process_new_once(
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="wiener-wohn-bot CLI: process only new apartments once")
     # Only keep dry-run; all other settings come from config/.env
-    p.add_argument("--dry-run", action="store_true", help="Do everything except actually send emails and write state")
+    p.add_argument("--dry-run", action="store_true", help="Do everything except actually send notifications and write state")
+    p.add_argument("--mark-seen", action="store_true",
+                   help="Record all currently listed apartments as already sent, without notifying or applying")
     return p.parse_args(argv)
 
 
@@ -307,12 +294,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Use LOG_LEVEL from config
     setup_logging(LOG_LEVEL)
     try:
-        # If dry-run, allow missing email config (we just preview)
-        if not args.dry_run:
-            validate_config()
+        # Dry-run and mark-seen send nothing, so notification settings aren't needed
+        validate_config(notifications=not (args.dry_run or args.mark_seen))
     except Exception as e:
         logging.error("Configuration invalid: %s", e)
-        send_error(f"Konfiguration fehlerhaft: {e}")
+        print(f"Configuration invalid: {e}")
+        notify_error(f"Konfiguration fehlerhaft: {e}")
         return 1
 
     try:
@@ -320,13 +307,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             state_file=SENT_IDS_FILE,
             detail_delay=DETAIL_DELAY,
             dry_run=args.dry_run,
+            mark_seen=args.mark_seen,
         )
-        print(f"Processed {count} new apartment(s)")
+        print(f"{'Marked' if args.mark_seen else 'Processed'} {count} new apartment(s)")
         return 0
     except Exception as e:  # pragma: no cover
         logging.error("CLI run failed: %s", e)
+        print(f"Run failed: {e}")
         if not args.dry_run:
-            send_error(str(e))
+            notify_error(str(e))
         return 2
 
 

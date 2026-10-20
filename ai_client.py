@@ -1,35 +1,40 @@
-"""Gemini AI client module.
+"""AI scoring client module.
 
-Provides a thin wrapper around the Google Gen AI SDK to score apartment
-listings. If AI is disabled or the key is missing, returns a fallback summary.
+Scores apartment listings with any provider that offers an OpenAI-compatible
+Chat Completions API (OpenAI, Gemini, DeepInfra, OpenRouter, Ollama, ...):
+the provider is chosen via OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL. If AI is
+disabled or the key is missing, returns a fallback summary.
 """
 from __future__ import annotations
 import logging
 import re
 from typing import Optional, Tuple
 
-from config import GEMINI_API_KEY, GEMINI_MODEL, ENABLE_AI, APT_EVAL_BASE_PROMPT
+from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, ENABLE_AI, APT_EVAL_BASE_PROMPT
 
 try:
-    from google import genai  # type: ignore
+    from openai import OpenAI  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
-    genai = None  # type: ignore
+    OpenAI = None  # type: ignore
+
+OPENAI_TIMEOUT_S = 60.0
 
 
 def _init_client():  # lazy init
     if not ENABLE_AI:
         logging.info("AI disabled via ENABLE_AI=0")
         return None
-    if not GEMINI_API_KEY:
-        logging.warning("GEMINI_API_KEY not set; returning fallback summaries")
+    if not OPENAI_API_KEY:
+        logging.warning("OPENAI_API_KEY not set; returning fallback summaries")
         return None
-    if genai is None:
-        logging.warning("google-genai not installed; returning fallback summaries")
+    if OpenAI is None:
+        logging.warning("openai not installed; returning fallback summaries")
         return None
     try:
-        return genai.Client(api_key=GEMINI_API_KEY)
+        # Timeout per request: a hanging request must not stall the whole run
+        return OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None, timeout=OPENAI_TIMEOUT_S, max_retries=1)
     except Exception as e:  # pragma: no cover
-        logging.error("Failed to initialize Gemini client: %s", e)
+        logging.error("Failed to initialize AI client: %s", e)
         return None
 
 
@@ -46,9 +51,9 @@ def _ensure_client():
 
 
 def evaluate_full_email(email_body: str) -> Tuple[Optional[int], str]:
-    """Evaluate a full apartment email body (including summary + raw fields).
+    """Evaluate a full apartment message body (including summary + raw fields).
 
-    Supplies the entire email content to the model together with the base
+    Supplies the entire message content to the model together with the base
     evaluation prompt and extracts a 0-100 score from the response.
     Returns (score, raw_model_text).
     """
@@ -62,9 +67,13 @@ def evaluate_full_email(email_body: str) -> Tuple[Optional[int], str]:
         "EMAIL-INHALT BEGINN\n" + email_body + "\nEMAIL-INHALT ENDE\n"
     )
     try:
-        resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        text = getattr(resp, 'text', '') or ''
-        cleaned = text.strip()
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = (resp.choices[0].message.content if resp.choices else '') or ''
+        # Some reasoning models prepend their thoughts in <think> tags
+        cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         m = re.search(r"(\b|^)\D?(100|\d{1,2})(?=\D|$)", cleaned)
         score = None
         if m:

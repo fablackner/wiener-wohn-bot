@@ -2,7 +2,7 @@
 
 The site (meinwohnticket.wien) is a single-page app backed by several GraphQL
 services under ``/api/<service>/graphql``. All of them require a logged-in
-session cookie.
+session; :func:`_graphql` logs in automatically (see :mod:`auth`) when needed.
 
 Public API:
         - :class:`Apartment`: metadata + raw detail data (if fetched)
@@ -19,22 +19,25 @@ from typing import Any, Optional, Dict, List, Tuple
 from urllib.parse import urlparse, parse_qs
 import requests
 
-from config import BASE_URL, SEARCH_URL, get_cookies
+from auth import USER_AGENT, login
+from config import BASE_URL, SEARCH_URL
 
 DEFAULT_HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "en-US,en-AT;q=0.9,en;q=0.8,de;q=0.7",
     "Content-Type": "application/json",
     "Origin": BASE_URL,
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+    "User-Agent": USER_AGENT,
 }
 
 GEOCODER_URL = "https://data.wien.gv.at/daten/OGDAddressService.svc/GetAddressInfo"
 SEARCH_PAGE_SIZE = 24
+# Newest first, regardless of the sort order chosen in the browser
+SEARCH_SORT = {"field": "ERSTELLUNGSZEITPUNKT", "direction": "DESC"}
 
 
 class SessionExpiredError(RuntimeError):
-    """Raised when the API answers with the login page instead of JSON."""
+    """Raised when the API still answers with the login page after logging in."""
 
 
 class GraphQLError(RuntimeError):
@@ -55,22 +58,35 @@ class Apartment:
     detail: Optional[Dict[str, Any]] = None
 
 
-def _graphql(session: requests.Session, service: str, operation: str, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
-    """POST a GraphQL operation to ``/api/<service>/graphql`` and return its ``data``."""
+def _graphql(
+    session: requests.Session,
+    service: str,
+    operation: str,
+    query: str,
+    variables: Dict[str, Any],
+    *,
+    _retry_login: bool = True,
+) -> Dict[str, Any]:
+    """POST a GraphQL operation to ``/api/<service>/graphql`` and return its ``data``.
+
+    Logs in (once) and retries if the session is not authenticated yet.
+    """
     url = f"{BASE_URL}/api/{service}/graphql"
     payload = {"operationName": operation, "variables": variables, "query": query}
     headers = dict(DEFAULT_HEADERS)
     headers["Referer"] = BASE_URL + "/"
-    response = session.post(url, json=payload, headers=headers, cookies=get_cookies(), timeout=30)
+    response = session.post(url, json=payload, headers=headers, timeout=30)
     logging.debug("%s %s status %s", service, operation, response.status_code)
     response.raise_for_status()
     if "json" not in response.headers.get("Content-Type", ""):
         # Unauthenticated requests get redirected to the HTML login portal
-        raise SessionExpiredError(
-            "The site returned its login page instead of data; your session cookie is "
-            f"missing or expired. Log in at {BASE_URL} in your browser and update "
-            "WB_SESSION_COOKIE in .env."
-        )
+        if not _retry_login:
+            raise SessionExpiredError(
+                "The site still returned its login page after logging in; "
+                "check WB_USERNAME/WB_PASSWORD or whether the login flow changed."
+            )
+        login(session)
+        return _graphql(session, service, operation, query, variables, _retry_login=False)
     body = response.json()
     if body.get("errors"):
         messages = "; ".join(str(e.get("message")) for e in body["errors"])
@@ -82,8 +98,8 @@ def _graphql(session: requests.Session, service: str, operation: str, query: str
 # Search
 ################################################################################
 _SEARCH_QUERY = """
-query searchWohnungen($filter: WohnungSearchFilter, $page: Page!) {
-  searchWohnungen(filter: $filter, page: $page) {
+query searchWohnungen($sort: WohnungSearchSort, $filter: WohnungSearchFilter, $page: Page!) {
+  searchWohnungen(sort: $sort, filter: $filter, page: $page) {
     totalHits
     hits {
       angebotUuid
@@ -157,7 +173,7 @@ def fetch_apartments(
         List[Apartment]
 
     Raises:
-        SessionExpiredError: If the session cookie is missing or expired.
+        LoginError / SessionExpiredError: If logging in fails.
     """
     sess = session or requests.Session()
     search_filter = search_filter_from_url(SEARCH_URL)
@@ -166,6 +182,7 @@ def fetch_apartments(
     offset = 0
     while True:
         data = _graphql(sess, "was", "searchWohnungen", _SEARCH_QUERY, {
+            "sort": SEARCH_SORT,
             "filter": search_filter,
             "page": {"size": SEARCH_PAGE_SIZE, "offset": offset},
         })

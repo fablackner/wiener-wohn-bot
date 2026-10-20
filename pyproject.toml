@@ -1,12 +1,12 @@
 [project]
 name = "wiener-wohn-bot"
 version = "0.1.0"
-description = "Bot that watches Wiener Wohnen listings and sends email notifications"
+description = "Bot that watches Mein Wiener Wohn-Ticket listings and sends Telegram (or email) notifications"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "requests",
     "beautifulsoup4",
     "python-dotenv",
-    "google-genai",
+    "openai",
 ]

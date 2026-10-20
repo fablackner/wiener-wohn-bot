@@ -1,0 +1,62 @@
+name: Check apartments
+
+on:
+  schedule:
+    # Hourly, off the full hour (GitHub's scheduler is busiest at :00)
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      mark_seen:
+        description: "Only record the current apartments as seen (no messages, no applications)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # push the seen-apartments state to the bot-state branch
+
+concurrency:
+  group: check-apartments
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The IDs of already-notified apartments live on the "bot-state" branch,
+      # checked out as a worktree in ./state
+      - name: Check out state branch
+        run: |
+          if git fetch --depth=1 origin bot-state; then
+            git worktree add state FETCH_HEAD
+          else
+            git worktree add --orphan -b bot-state state
+          fi
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Write .env from secret
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+        run: printf '%s\n' "$ENV_FILE" > .env
+
+      - name: Run bot
+        env:
+          SENT_IDS_FILE: state/sent_apartments.txt
+          LOG_FILE: "" # log to the job output instead of a file
+          LOG_LEVEL: WARNING # the repo is public, and so are its Actions logs
+        run: uv run --frozen main.py ${{ inputs.mark_seen && '--mark-seen' || '' }}
+
+      - name: Save state
+        if: success() || failure()
+        working-directory: state
+        run: |
+          [ -f sent_apartments.txt ] || exit 0
+          git add sent_apartments.txt
+          git diff --cached --quiet && exit 0
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Update seen apartments"
+          git push origin HEAD:bot-state
