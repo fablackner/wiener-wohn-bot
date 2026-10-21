@@ -18,6 +18,8 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from config import BASE_URL, WB_USERNAME, WB_PASSWORD
 
@@ -31,6 +33,23 @@ _JS_REDIRECT = re.compile(r"window\.location(?:\.href)?\s*=\s*[\"']([^\"']+)[\"'
 
 class LoginError(RuntimeError):
     """Raised when logging in to meinwohnticket.wien fails."""
+
+
+def make_session() -> requests.Session:
+    """Return a session that retries GET requests on temporary server errors (502/503/504).
+
+    POSTs (login form, applications) are never retried, so nothing is sent twice.
+    """
+    retry = Retry(
+        total=3,
+        backoff_factor=2,  # retry at once, then after 4s and 8s
+        status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,  # hand back the last response, so raise_for_status() reports it
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
 
 
 def _form_fields(form) -> dict[str, str]:
@@ -101,4 +120,4 @@ def login(session: requests.Session) -> None:
     logging.info("Login finished at %s", response.url)
 
 
-__all__ = ["login", "LoginError", "USER_AGENT"]
+__all__ = ["login", "LoginError", "USER_AGENT", "make_session"]

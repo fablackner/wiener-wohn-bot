@@ -45,7 +45,7 @@ from summary import (
 )
 from ai_client import evaluate_full_email
 from notifier import notify, notify_error
-import requests
+from auth import make_session
 
 
 def setup_logging(log_level: str) -> None:
@@ -155,7 +155,7 @@ def process_new_once(
     Returns the number of new apartments processed (notified, previewed or marked).
     """
     # Reuse a single HTTP session for consistent cookies/headers
-    session = requests.Session()
+    session = make_session()
     # Fetch listing with IDs only for speed
     apartments = fetch_apartments(fetch_details=False, session=session)
     id_to_apartment = {a.apt_id: a for a in apartments}
